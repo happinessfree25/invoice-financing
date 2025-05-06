@@ -313,3 +313,99 @@
   )
 )
 
+(define-constant err-invalid-trade (err u111))
+
+(define-public (list-invoice-for-trade 
+    (invoice-id uint)
+    (new-discount-rate uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+  )
+    (asserts! (is-eq (some tx-sender) (get investor invoice-data)) err-unauthorized)
+    (asserts! (is-eq (get status invoice-data) u3) err-invoice-not-funded)
+    (asserts! (< new-discount-rate u10000) err-invalid-amount)
+    
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice-data 
+        { 
+          discount-rate: new-discount-rate,
+          status: u6
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (buy-traded-invoice (invoice-id uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (trade-amount (unwrap! (calculate-funding-amount invoice-id) err-not-found))
+    (buyer-balance (get balance (get-user-balance tx-sender)))
+    (seller (unwrap! (get investor invoice-data) err-not-found))
+  )
+    (asserts! (is-eq (get status invoice-data) u6) err-invalid-trade)
+    (asserts! (>= buyer-balance trade-amount) err-insufficient-funds)
+    
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice-data 
+        {
+          investor: (some tx-sender),
+          status: u3
+        }
+      )
+    )
+    
+    (map-set user-balance 
+      { user: tx-sender }
+      { balance: (- buyer-balance trade-amount) }
+    )
+    
+    (map-set user-balance
+      { user: seller }
+      { balance: (+ (get balance (get-user-balance seller)) trade-amount) }
+    )
+    
+    (ok true)
+  )
+)
+
+
+(define-constant err-invalid-batch (err u112))
+(define-constant max-batch-size u10)
+
+(define-public (create-invoice-batch
+    (debtors (list 10 principal))
+    (amounts (list 10 uint))
+    (discount-rates (list 10 uint))
+    (due-dates (list 10 uint))
+    (descriptions (list 10 (string-utf8 256))))
+  (let (
+    (batch-size (len debtors))
+  )
+    (asserts! (> batch-size u0) err-invalid-batch)
+    (asserts! (<= batch-size max-batch-size) err-invalid-batch)
+    (asserts! (is-eq batch-size (len amounts)) err-invalid-batch)
+    (asserts! (is-eq batch-size (len discount-rates)) err-invalid-batch)
+    (asserts! (is-eq batch-size (len due-dates)) err-invalid-batch)
+    (asserts! (is-eq batch-size (len descriptions)) err-invalid-batch)
+    
+    (ok (map create-invoice-internal 
+      debtors 
+      amounts 
+      discount-rates 
+      due-dates 
+      descriptions))
+  )
+)
+
+(define-private (create-invoice-internal
+    (debtor principal)
+    (amount uint)
+    (discount-rate uint)
+    (due-date uint)
+    (description (string-utf8 256)))
+  (create-invoice debtor amount discount-rate due-date description)
+)
