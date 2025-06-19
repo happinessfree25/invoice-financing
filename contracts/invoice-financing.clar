@@ -409,3 +409,224 @@
     (description (string-utf8 256)))
   (create-invoice debtor amount discount-rate due-date description)
 )
+
+(define-constant err-invalid-rating (err u113))
+(define-constant min-credit-score u300)
+(define-constant max-credit-score u850)
+(define-constant default-credit-score u600)
+
+(define-map user-credit-profile
+  { user: principal }
+  {
+    total-invoices: uint,
+    paid-on-time: uint,
+    total-defaults: uint,
+    total-volume: uint,
+    credit-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-map invoice-ratings
+  { invoice-id: uint }
+  {
+    risk-rating: uint,
+    investor-rating: uint,
+    payment-rating: uint,
+    rated-by: (list 10 principal)
+  }
+)
+
+(define-read-only (get-user-credit-profile (user principal))
+  (default-to
+    {
+      total-invoices: u0,
+      paid-on-time: u0,
+      total-defaults: u0,
+      total-volume: u0,
+      credit-score: default-credit-score,
+      last-updated: u0
+    }
+    (map-get? user-credit-profile { user: user })
+  )
+)
+
+(define-read-only (get-invoice-rating (invoice-id uint))
+  (default-to
+    {
+      risk-rating: u0,
+      investor-rating: u0,
+      payment-rating: u0,
+      rated-by: (list)
+    }
+    (map-get? invoice-ratings { invoice-id: invoice-id })
+  )
+)
+
+(define-read-only (calculate-credit-score (user principal))
+  (let (
+    (profile (get-user-credit-profile user))
+    (total-invoices (get total-invoices profile))
+    (paid-on-time (get paid-on-time profile))
+    (total-defaults (get total-defaults profile))
+  )
+    (if (is-eq total-invoices u0)
+      (ok default-credit-score)
+      (let (
+        (payment-ratio (/ (* paid-on-time u100) total-invoices))
+        (default-ratio (/ (* total-defaults u100) total-invoices))
+        (base-score (+ u300 (* payment-ratio u4)))
+        (penalty (* default-ratio u10))
+        (final-score (if (> base-score penalty) (- base-score penalty) min-credit-score))
+      )
+        (ok (if (> final-score max-credit-score) max-credit-score final-score))
+      )
+    )
+  )
+)
+
+(define-public (rate-invoice 
+    (invoice-id uint)
+    (risk-rating uint)
+    (investor-rating uint)
+    (payment-rating uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (current-rating (get-invoice-rating invoice-id))
+    (current-raters (get rated-by current-rating))
+  )
+    (asserts! (<= risk-rating u10) err-invalid-rating)
+    (asserts! (<= investor-rating u10) err-invalid-rating)
+    (asserts! (<= payment-rating u10) err-invalid-rating)
+    (asserts! (> risk-rating u0) err-invalid-rating)
+    (asserts! (> investor-rating u0) err-invalid-rating)
+    (asserts! (> payment-rating u0) err-invalid-rating)
+    (asserts! (not (is-some (index-of current-raters tx-sender))) err-already-exists)
+    
+    (map-set invoice-ratings
+      { invoice-id: invoice-id }
+      {
+        risk-rating: (+ (get risk-rating current-rating) risk-rating),
+        investor-rating: (+ (get investor-rating current-rating) investor-rating),
+        payment-rating: (+ (get payment-rating current-rating) payment-rating),
+        rated-by: (unwrap! (as-max-len? (append current-raters tx-sender) u10) err-invalid-rating)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-credit-profile-on-payment (invoice-id uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (debtor (get debtor invoice-data))
+    (issuer (get issuer invoice-data))
+    (amount (get amount invoice-data))
+    (due-date (get due-date invoice-data))
+    (current-time stacks-block-height)
+    (debtor-profile (get-user-credit-profile debtor))
+    (issuer-profile (get-user-credit-profile issuer))
+  )
+    (asserts! (is-eq (get status invoice-data) u4) err-invoice-not-funded)
+    
+    (map-set user-credit-profile
+      { user: debtor }
+      {
+        total-invoices: (+ (get total-invoices debtor-profile) u1),
+        paid-on-time: (+ (get paid-on-time debtor-profile) (if (<= current-time due-date) u1 u0)),
+        total-defaults: (get total-defaults debtor-profile),
+        total-volume: (+ (get total-volume debtor-profile) amount),
+        credit-score: (unwrap! (calculate-credit-score debtor) err-invalid-rating),
+        last-updated: current-time
+      }
+    )
+    
+    (map-set user-credit-profile
+      { user: issuer }
+      {
+        total-invoices: (+ (get total-invoices issuer-profile) u1),
+        paid-on-time: (+ (get paid-on-time issuer-profile) u1),
+        total-defaults: (get total-defaults issuer-profile),
+        total-volume: (+ (get total-volume issuer-profile) amount),
+        credit-score: (unwrap! (calculate-credit-score issuer) err-invalid-rating),
+        last-updated: current-time
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-credit-profile-on-default (invoice-id uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (debtor (get debtor invoice-data))
+    (amount (get amount invoice-data))
+    (current-time stacks-block-height)
+    (debtor-profile (get-user-credit-profile debtor))
+  )
+    (asserts! (is-eq (get status invoice-data) u5) err-invoice-not-funded)
+    
+    (map-set user-credit-profile
+      { user: debtor }
+      {
+        total-invoices: (+ (get total-invoices debtor-profile) u1),
+        paid-on-time: (get paid-on-time debtor-profile),
+        total-defaults: (+ (get total-defaults debtor-profile) u1),
+        total-volume: (+ (get total-volume debtor-profile) amount),
+        credit-score: (unwrap! (calculate-credit-score debtor) err-invalid-rating),
+        last-updated: current-time
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-recommended-discount-rate (debtor principal))
+  (let (
+    (credit-score (get credit-score (get-user-credit-profile debtor)))
+  )
+    (if (>= credit-score u750)
+      (ok u200)
+      (if (>= credit-score u650)
+        (ok u400)
+        (if (>= credit-score u550)
+          (ok u600)
+          (ok u800)
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-average-invoice-rating (invoice-id uint))
+  (let (
+    (rating-data (get-invoice-rating invoice-id))
+    (num-raters (len (get rated-by rating-data)))
+  )
+    (if (is-eq num-raters u0)
+      (ok { risk-avg: u0, investor-avg: u0, payment-avg: u0 })
+      (ok {
+        risk-avg: (/ (get risk-rating rating-data) num-raters),
+        investor-avg: (/ (get investor-rating rating-data) num-raters),
+        payment-avg: (/ (get payment-rating rating-data) num-raters)
+      })
+    )
+  )
+)
+
+(define-public (enhanced-pay-invoice (invoice-id uint))
+  (match (pay-invoice invoice-id)
+    success (update-credit-profile-on-payment invoice-id)
+    error (err error)
+  )
+)
+
+(define-public (enhanced-mark-invoice-defaulted (invoice-id uint))
+  (match (mark-invoice-defaulted invoice-id)
+    success (update-credit-profile-on-default invoice-id)
+    error (err error)
+  )
+)
