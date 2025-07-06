@@ -463,6 +463,161 @@
   )
 )
 
+(define-constant err-escrow-insufficient (err u114))
+(define-constant err-escrow-already-funded (err u115))
+(define-constant err-escrow-not-ready (err u116))
+
+(define-map user-escrow-balance
+  { user: principal }
+  { balance: uint }
+)
+
+(define-map invoice-escrow-funding
+  { invoice-id: uint }
+  { 
+    funded: bool,
+    amount: uint,
+    funded-date: uint
+  }
+)
+
+(define-read-only (get-user-escrow-balance (user principal))
+  (default-to
+    { balance: u0 }
+    (map-get? user-escrow-balance { user: user })
+  )
+)
+
+(define-read-only (get-invoice-escrow-status (invoice-id uint))
+  (default-to
+    { 
+      funded: false,
+      amount: u0,
+      funded-date: u0
+    }
+    (map-get? invoice-escrow-funding { invoice-id: invoice-id })
+  )
+)
+
+(define-public (deposit-to-escrow (amount uint))
+  (let (
+    (user-escrow-data (get-user-escrow-balance tx-sender))
+    (user-balance-data (get-user-balance tx-sender))
+  )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= (get balance user-balance-data) amount) err-insufficient-funds)
+    
+    (map-set user-balance
+      { user: tx-sender }
+      { balance: (- (get balance user-balance-data) amount) }
+    )
+    
+    (map-set user-escrow-balance
+      { user: tx-sender }
+      { balance: (+ (get balance user-escrow-data) amount) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (withdraw-from-escrow (amount uint))
+  (let (
+    (user-escrow-data (get-user-escrow-balance tx-sender))
+    (user-balance-data (get-user-balance tx-sender))
+  )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= (get balance user-escrow-data) amount) err-escrow-insufficient)
+    
+    (map-set user-escrow-balance
+      { user: tx-sender }
+      { balance: (- (get balance user-escrow-data) amount) }
+    )
+    
+    (map-set user-balance
+      { user: tx-sender }
+      { balance: (+ (get balance user-balance-data) amount) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (fund-invoice-escrow (invoice-id uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (escrow-status (get-invoice-escrow-status invoice-id))
+    (debtor (get debtor invoice-data))
+    (invoice-amount (get amount invoice-data))
+    (debtor-escrow-data (get-user-escrow-balance debtor))
+  )
+    (asserts! (is-eq tx-sender debtor) err-unauthorized)
+    (asserts! (is-eq (get status invoice-data) u3) err-invoice-not-funded)
+    (asserts! (not (get funded escrow-status)) err-escrow-already-funded)
+    (asserts! (>= (get balance debtor-escrow-data) invoice-amount) err-escrow-insufficient)
+    
+    (map-set user-escrow-balance
+      { user: debtor }
+      { balance: (- (get balance debtor-escrow-data) invoice-amount) }
+    )
+    
+    (map-set invoice-escrow-funding
+      { invoice-id: invoice-id }
+      {
+        funded: true,
+        amount: invoice-amount,
+        funded-date: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-escrow-payment (invoice-id uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (escrow-status (get-invoice-escrow-status invoice-id))
+    (due-date (get due-date invoice-data))
+    (current-time stacks-block-height)
+    (investor-principal (unwrap! (get investor invoice-data) err-not-found))
+    (invoice-amount (get amount invoice-data))
+    (investor-balance-data (get-user-balance investor-principal))
+  )
+    (asserts! (is-eq (get status invoice-data) u3) err-invoice-not-funded)
+    (asserts! (get funded escrow-status) err-escrow-not-ready)
+    (asserts! (>= current-time due-date) err-invoice-not-due)
+    
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice-data { status: u4 })
+    )
+    
+    (map-set user-balance
+      { user: investor-principal }
+      { balance: (+ (get balance investor-balance-data) invoice-amount) }
+    )
+    
+    (update-credit-profile-on-payment invoice-id)
+  )
+)
+
+(define-read-only (get-escrow-ready-invoices (debtor principal))
+  (let (
+    (debtor-escrow-balance (get balance (get-user-escrow-balance debtor)))
+  )
+    (ok debtor-escrow-balance)
+  )
+)
+
+(define-public (bulk-fund-escrow-invoices (invoice-ids (list 10 uint)))
+  (let (
+    (results (map fund-invoice-escrow invoice-ids))
+  )
+    (ok results)
+  )
+)
+
 (define-read-only (calculate-credit-score (user principal))
   (let (
     (profile (get-user-credit-profile user))
