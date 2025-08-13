@@ -785,3 +785,371 @@
     error (err error)
   )
 )
+
+;; Fractional Investment System
+;; Allows multiple investors to own shares of a single invoice
+
+(define-constant err-invalid-shares (err u117))
+(define-constant err-shares-not-available (err u118))
+(define-constant err-share-transfer-failed (err u119))
+(define-constant err-insufficient-shares (err u120))
+(define-constant err-not-shareholder (err u121))
+(define-constant max-shareholders u50)
+(define-constant min-share-price u100)
+
+;; Track fractional invoice configuration
+(define-map fractional-invoices
+  { invoice-id: uint }
+  {
+    total-shares: uint,
+    available-shares: uint,
+    share-price: uint,
+    min-investment: uint,
+    is-fractional: bool,
+    shareholders-count: uint
+  }
+)
+
+;; Track individual share ownership
+(define-map invoice-shares
+  { invoice-id: uint, investor: principal }
+  {
+    shares-owned: uint,
+    investment-amount: uint,
+    purchase-date: uint
+  }
+)
+
+;; Track all shareholders for an invoice
+(define-map invoice-shareholders
+  { invoice-id: uint }
+  { shareholders: (list 50 principal) }
+)
+
+;; Share transfer offers
+(define-map share-transfer-offers
+  { invoice-id: uint, seller: principal, buyer: principal }
+  {
+    shares-amount: uint,
+    price-per-share: uint,
+    expiry-date: uint,
+    active: bool
+  }
+)
+
+;; Read-only functions for fractional system
+
+(define-read-only (get-fractional-invoice-info (invoice-id uint))
+  (default-to
+    {
+      total-shares: u0,
+      available-shares: u0,
+      share-price: u0,
+      min-investment: u0,
+      is-fractional: false,
+      shareholders-count: u0
+    }
+    (map-get? fractional-invoices { invoice-id: invoice-id })
+  )
+)
+
+(define-read-only (get-investor-shares (invoice-id uint) (investor principal))
+  (default-to
+    {
+      shares-owned: u0,
+      investment-amount: u0,
+      purchase-date: u0
+    }
+    (map-get? invoice-shares { invoice-id: invoice-id, investor: investor })
+  )
+)
+
+(define-read-only (get-invoice-shareholders (invoice-id uint))
+  (default-to
+    { shareholders: (list) }
+    (map-get? invoice-shareholders { invoice-id: invoice-id })
+  )
+)
+
+(define-read-only (get-share-transfer-offer 
+    (invoice-id uint) 
+    (seller principal) 
+    (buyer principal))
+  (default-to
+    {
+      shares-amount: u0,
+      price-per-share: u0,
+      expiry-date: u0,
+      active: false
+    }
+    (map-get? share-transfer-offers 
+      { invoice-id: invoice-id, seller: seller, buyer: buyer })
+  )
+)
+
+(define-read-only (calculate-share-payout 
+    (invoice-id uint) 
+    (investor principal))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (investor-shares (get-investor-shares invoice-id investor))
+    (fractional-info (get-fractional-invoice-info invoice-id))
+    (total-amount (get amount invoice-data))
+    (investor-share-count (get shares-owned investor-shares))
+    (total-shares (get total-shares fractional-info))
+  )
+    (if (and (> investor-share-count u0) (> total-shares u0))
+      (ok (/ (* total-amount investor-share-count) total-shares))
+      (ok u0)
+    )
+  )
+)
+
+;; Public functions for fractional investment
+
+(define-public (enable-fractional-funding 
+    (invoice-id uint)
+    (total-shares uint)
+    (min-investment uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (funding-amount (unwrap! (calculate-funding-amount invoice-id) err-not-found))
+    (share-price (/ funding-amount total-shares))
+  )
+    ;; Verify ownership and status
+    (asserts! (is-eq tx-sender (get owner (unwrap! (get-invoice-owner invoice-id) err-not-found))) err-unauthorized)
+    (asserts! (is-eq (get status invoice-data) u2) err-invoice-not-for-sale)
+    (asserts! (> total-shares u1) err-invalid-shares)
+    (asserts! (>= share-price min-share-price) err-invalid-amount)
+    (asserts! (>= min-investment share-price) err-invalid-amount)
+    
+    ;; Enable fractional funding
+    (map-set fractional-invoices
+      { invoice-id: invoice-id }
+      {
+        total-shares: total-shares,
+        available-shares: total-shares,
+        share-price: share-price,
+        min-investment: min-investment,
+        is-fractional: true,
+        shareholders-count: u0
+      }
+    )
+    
+    ;; Initialize empty shareholders list
+    (map-set invoice-shareholders
+      { invoice-id: invoice-id }
+      { shareholders: (list) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (purchase-invoice-shares 
+    (invoice-id uint)
+    (shares-to-buy uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (fractional-info (get-fractional-invoice-info invoice-id))
+    (user-balance-data (get-user-balance tx-sender))
+    (current-shares (get-investor-shares invoice-id tx-sender))
+    (purchase-amount (* shares-to-buy (get share-price fractional-info)))
+    (current-shareholders (get shareholders (get-invoice-shareholders invoice-id)))
+  )
+    ;; Verify fractional funding is enabled and shares available
+    (asserts! (get is-fractional fractional-info) err-shares-not-available)
+    (asserts! (is-eq (get status invoice-data) u2) err-invoice-not-for-sale)
+    (asserts! (>= (get available-shares fractional-info) shares-to-buy) err-shares-not-available)
+    (asserts! (>= purchase-amount (get min-investment fractional-info)) err-invalid-amount)
+    (asserts! (>= (get balance user-balance-data) purchase-amount) err-insufficient-funds)
+    
+    ;; Update user balance
+    (map-set user-balance
+      { user: tx-sender }
+      { balance: (- (get balance user-balance-data) purchase-amount) }
+    )
+    
+    ;; Update invoice issuer balance
+    (map-set user-balance
+      { user: (get issuer invoice-data) }
+      { balance: (+ (get balance (get-user-balance (get issuer invoice-data))) purchase-amount) }
+    )
+    
+    ;; Update investor shares
+    (map-set invoice-shares
+      { invoice-id: invoice-id, investor: tx-sender }
+      {
+        shares-owned: (+ (get shares-owned current-shares) shares-to-buy),
+        investment-amount: (+ (get investment-amount current-shares) purchase-amount),
+        purchase-date: stacks-block-height
+      }
+    )
+    
+    ;; Update fractional invoice info
+    (map-set fractional-invoices
+      { invoice-id: invoice-id }
+      (merge fractional-info 
+        {
+          available-shares: (- (get available-shares fractional-info) shares-to-buy),
+          shareholders-count: (if (is-eq (get shares-owned current-shares) u0)
+                                (+ (get shareholders-count fractional-info) u1)
+                                (get shareholders-count fractional-info))
+        }
+      )
+    )
+    
+    ;; Add to shareholders list if new investor
+    (if (is-eq (get shares-owned current-shares) u0)
+      (map-set invoice-shareholders
+        { invoice-id: invoice-id }
+        { shareholders: (unwrap! (as-max-len? (append current-shareholders tx-sender) u50) err-invalid-shares) }
+      )
+      true
+    )
+    
+    ;; Check if invoice is fully funded
+    (if (is-eq (get available-shares (get-fractional-invoice-info invoice-id)) u0)
+      (map-set invoices
+        { invoice-id: invoice-id }
+        (merge invoice-data { status: u3 })
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-share-transfer-offer
+    (invoice-id uint)
+    (buyer principal)
+    (shares-amount uint)
+    (price-per-share uint)
+    (expiry-blocks uint))
+  (let (
+    (investor-shares (get-investor-shares invoice-id tx-sender))
+    (expiry-date (+ stacks-block-height expiry-blocks))
+  )
+    ;; Verify share ownership and valid offer
+    (asserts! (>= (get shares-owned investor-shares) shares-amount) err-insufficient-shares)
+    (asserts! (> shares-amount u0) err-invalid-shares)
+    (asserts! (> price-per-share u0) err-invalid-amount)
+    (asserts! (> expiry-blocks u0) err-invalid-amount)
+    
+    ;; Create transfer offer
+    (map-set share-transfer-offers
+      { invoice-id: invoice-id, seller: tx-sender, buyer: buyer }
+      {
+        shares-amount: shares-amount,
+        price-per-share: price-per-share,
+        expiry-date: expiry-date,
+        active: true
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (accept-share-transfer-offer
+    (invoice-id uint)
+    (seller principal))
+  (let (
+    (transfer-offer (get-share-transfer-offer invoice-id seller tx-sender))
+    (seller-shares (get-investor-shares invoice-id seller))
+    (buyer-shares (get-investor-shares invoice-id tx-sender))
+    (buyer-balance-data (get-user-balance tx-sender))
+    (seller-balance-data (get-user-balance seller))
+    (total-cost (* (get shares-amount transfer-offer) (get price-per-share transfer-offer)))
+  )
+    ;; Verify offer validity and buyer balance
+    (asserts! (get active transfer-offer) err-share-transfer-failed)
+    (asserts! (< stacks-block-height (get expiry-date transfer-offer)) err-share-transfer-failed)
+    (asserts! (>= (get shares-owned seller-shares) (get shares-amount transfer-offer)) err-insufficient-shares)
+    (asserts! (>= (get balance buyer-balance-data) total-cost) err-insufficient-funds)
+    
+    ;; Transfer payment
+    (map-set user-balance
+      { user: tx-sender }
+      { balance: (- (get balance buyer-balance-data) total-cost) }
+    )
+    
+    (map-set user-balance
+      { user: seller }
+      { balance: (+ (get balance seller-balance-data) total-cost) }
+    )
+    
+    ;; Transfer shares
+    (map-set invoice-shares
+      { invoice-id: invoice-id, investor: seller }
+      (merge seller-shares 
+        { shares-owned: (- (get shares-owned seller-shares) (get shares-amount transfer-offer)) }
+      )
+    )
+    
+    (map-set invoice-shares
+      { invoice-id: invoice-id, investor: tx-sender }
+      {
+        shares-owned: (+ (get shares-owned buyer-shares) (get shares-amount transfer-offer)),
+        investment-amount: (+ (get investment-amount buyer-shares) total-cost),
+        purchase-date: stacks-block-height
+      }
+    )
+    
+    ;; Deactivate transfer offer
+    (map-set share-transfer-offers
+      { invoice-id: invoice-id, seller: seller, buyer: tx-sender }
+      (merge transfer-offer { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Variable to hold current invoice id for distribution
+(define-data-var current-distribution-invoice-id uint u0)
+
+(define-public (distribute-fractional-payment (invoice-id uint))
+  (let (
+    (invoice-data (unwrap! (get-invoice invoice-id) err-not-found))
+    (fractional-info (get-fractional-invoice-info invoice-id))
+    (shareholders-data (get-invoice-shareholders invoice-id))
+  )
+    ;; Verify invoice is paid and fractional
+    (asserts! (is-eq (get status invoice-data) u4) err-invoice-not-funded)
+    (asserts! (get is-fractional fractional-info) err-shares-not-available)
+    
+    ;; Set current invoice id for distribution
+    (var-set current-distribution-invoice-id invoice-id)
+    
+    ;; Distribute payments to all shareholders
+    (ok (map distribute-to-shareholder-wrapper (get shareholders shareholders-data)))
+  )
+)
+
+(define-private (distribute-to-shareholder-wrapper (shareholder principal))
+  (distribute-to-shareholder shareholder (var-get current-distribution-invoice-id))
+)
+
+(define-private (distribute-to-shareholder (shareholder principal) (invoice-id uint))
+  (match (calculate-share-payout invoice-id shareholder)
+    ok-value 
+    (let (
+      (shareholder-balance-data (get-user-balance shareholder))
+    )
+      (if (> ok-value u0)
+        (begin
+          (map-set user-balance
+            { user: shareholder }
+            { balance: (+ (get balance shareholder-balance-data) ok-value) }
+          )
+          true
+        )
+        true
+      )
+    )
+    err-value false
+  )
+)
+
